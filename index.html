@@ -11,6 +11,7 @@
     button:active { opacity: 0.8; }
     .weight { font-size: 48px; font-weight: bold; text-align: center; margin: 12px 0 4px; }
     .status { text-align: center; color: #86868b; font-size: 14px; margin: 6px 0 0; }
+    .log { font-size: 11px; color: #666; word-break: break-all; margin-top: 8px; background: #eee; padding: 6px; border-radius: 6px; }
     .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
     .item { background: #f5f5f7; padding: 12px; border-radius: 10px; }
     .label { font-size: 12px; color: #6e6e73; }
@@ -30,9 +31,10 @@
         <option value="0">女性</option>
       </select>
     </div>
-    <button id="scanBtn">スキャン開始（体組成計に乗る）</button>
+    <button id="scanBtn">スキャン開始（先に体組成計に乗る）</button>
     <p class="status" id="status">待機中...</p>
     <div class="weight" id="weight">--.- kg</div>
+    <div class="log" id="debugLog">デバッグログ: 待機中</div>
   </div>
 
   <div class="card" id="resultCard" style="display:none;">
@@ -50,8 +52,8 @@
 const heightEl = document.getElementById('heightInput');
 const ageEl = document.getElementById('ageInput');
 const sexEl = document.getElementById('sexInput');
+const debugEl = document.getElementById('debugLog');
 
-// 前回の入力値を復元
 heightEl.value = localStorage.getItem('cm3_height') || '171.0';
 ageEl.value = localStorage.getItem('cm3_age') || '21';
 sexEl.value = localStorage.getItem('cm3_sex') || '1';
@@ -85,47 +87,78 @@ function calcBody(weightKg, impHigh, impLow) {
   return { bmi, fat, lbm: lbm.toFixed(1), water, muscle, bmr };
 }
 
+function handlePacket(mData) {
+  if (!mData || mData.byteLength < 12) return;
+  const dec = new Uint8Array(mData.byteLength);
+  const hexArr = [];
+  for (let i = 0; i < mData.byteLength; i++) {
+    dec[i] = mData.getUint8(i) ^ 0xa0;
+    hexArr.push(dec[i].toString(16).padStart(2, '0'));
+  }
+  debugEl.textContent = '受信: ' + hexArr.join(' ');
+
+  const isLocked = (dec[6] & 0x80) !== 0;
+  const weightG = (dec[8] << 8) | dec[9];
+  const weightKg = weightG / 1000.0;
+
+  if (weightKg > 0) {
+    document.getElementById('weight').textContent = weightKg.toFixed(1) + ' kg';
+    document.getElementById('status').textContent = isLocked ? '✅ 測定完了！' : '計測中...';
+
+    if (isLocked && weightKg > 5.0) {
+      const res = calcBody(weightKg, dec[7], dec[10]);
+      document.getElementById('bmi').textContent = res.bmi;
+      document.getElementById('fat').textContent = res.fat + ' %';
+      document.getElementById('lbm').textContent = res.lbm + ' kg';
+      document.getElementById('water').textContent = res.water + ' %';
+      document.getElementById('muscle').textContent = res.muscle + ' %';
+      document.getElementById('bmr').textContent = res.bmr + ' kcal';
+      document.getElementById('resultCard').style.display = 'block';
+    }
+  }
+}
+
 document.getElementById('scanBtn').addEventListener('click', async () => {
   saveSettings();
   const statusEl = document.getElementById('status');
   try {
-    statusEl.textContent = 'BLEスキャン中... 体組成計に乗ってください';
-    await navigator.bluetooth.requestLEScan({
+    if (!navigator.bluetooth) {
+      statusEl.textContent = 'エラー: Web Bluetooth非対応ブラウザです';
+      return;
+    }
+
+    // 1. まずrequestLEScanを試す
+    if (navigator.bluetooth.requestLEScan) {
+      statusEl.textContent = 'LEスキャン開始...';
+      await navigator.bluetooth.requestLEScan({ filters: [{ name: 'CM3-HM' }], keepRepeatedDevices: true });
+      navigator.bluetooth.addEventListener('advertisementreceived', e => {
+        const mData = e.manufacturerData.get(0xa0ac);
+        if (mData) handlePacket(mData);
+      });
+      return;
+    }
+
+    // 2. Bluefy用: requestDevice + watchAdvertisements
+    statusEl.textContent = 'デバイス選択画面で「CM3-HM」を選んでください';
+    const device = await navigator.bluetooth.requestDevice({
       filters: [{ name: 'CM3-HM' }],
-      keepRepeatedDevices: true
+      optionalManufacturerData: [0xa0ac]
     });
 
-    navigator.bluetooth.addEventListener('advertisementreceived', event => {
-      const mData = event.manufacturerData.get(0xa0ac);
-      if (!mData || mData.byteLength < 12) return;
-
-      const dec = new Uint8Array(mData.byteLength);
-      for (let i = 0; i < mData.byteLength; i++) {
-        dec[i] = mData.getUint8(i) ^ 0xa0;
-      }
-
-      const isLocked = (dec[6] & 0x80) !== 0;
-      const weightG = (dec[8] << 8) | dec[9];
-      const weightKg = weightG / 1000.0;
-
-      if (weightKg > 0) {
-        document.getElementById('weight').textContent = weightKg.toFixed(1) + ' kg';
-        statusEl.textContent = isLocked ? '✅ 測定完了！' : '計測中...';
-
-        if (isLocked && weightKg > 5.0) {
-          const res = calcBody(weightKg, dec[7], dec[10]);
-          document.getElementById('bmi').textContent = res.bmi;
-          document.getElementById('fat').textContent = res.fat + ' %';
-          document.getElementById('lbm').textContent = res.lbm + ' kg';
-          document.getElementById('water').textContent = res.water + ' %';
-          document.getElementById('muscle').textContent = res.muscle + ' %';
-          document.getElementById('bmr').textContent = res.bmr + ' kcal';
-          document.getElementById('resultCard').style.display = 'block';
-        }
-      }
+    device.addEventListener('advertisementreceived', e => {
+      const mData = e.manufacturerData.get(0xa0ac);
+      if (mData) handlePacket(mData);
     });
+
+    if (device.watchAdvertisements) {
+      statusEl.textContent = 'アドバタイズ監視中... そのまま測定完了までお待ちください';
+      await device.watchAdvertisements();
+    } else {
+      statusEl.textContent = 'エラー: watchAdvertisements非対応です';
+    }
   } catch (err) {
-    statusEl.textContent = 'エラー: ' + err;
+    statusEl.textContent = 'エラー: ' + err.message;
+    debugEl.textContent = String(err);
   }
 });
 </script>
