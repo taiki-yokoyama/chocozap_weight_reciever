@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CM3-HM 体組成リーダー</title>
+  <style>
+    body { font-family: -apple-system, sans-serif; padding: 16px; background: #f5f5f7; color: #1d1d1f; max-width: 500px; margin: 0 auto; }
+    .card { background: white; padding: 18px; border-radius: 16px; box-shadow: 0 2px 10px rgba(0,0,0,0.05); margin-bottom: 14px; }
+    button { width: 100%; padding: 16px; font-size: 17px; font-weight: bold; background: #007aff; color: white; border: none; border-radius: 12px; cursor: pointer; }
+    button:active { opacity: 0.8; }
+    .weight { font-size: 48px; font-weight: bold; text-align: center; margin: 12px 0 4px; }
+    .status { text-align: center; color: #86868b; font-size: 14px; margin: 6px 0 0; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .item { background: #f5f5f7; padding: 12px; border-radius: 10px; }
+    .label { font-size: 12px; color: #6e6e73; }
+    .val { font-size: 20px; font-weight: bold; margin-top: 4px; }
+    .settings { display: flex; gap: 8px; margin-bottom: 10px; }
+    .settings input, .settings select { width: 100%; padding: 8px; border: 1px solid #d2d2d7; border-radius: 8px; font-size: 14px; }
+  </style>
+</head>
+<body>
+
+  <div class="card">
+    <div class="settings">
+      <input type="number" id="heightInput" placeholder="身長(cm)" step="0.1">
+      <input type="number" id="ageInput" placeholder="年齢">
+      <select id="sexInput">
+        <option value="1">男性</option>
+        <option value="0">女性</option>
+      </select>
+    </div>
+    <button id="scanBtn">スキャン開始（体組成計に乗る）</button>
+    <p class="status" id="status">待機中...</p>
+    <div class="weight" id="weight">--.- kg</div>
+  </div>
+
+  <div class="card" id="resultCard" style="display:none;">
+    <div class="grid">
+      <div class="item"><div class="label">BMI</div><div class="val" id="bmi">-</div></div>
+      <div class="item"><div class="label">体脂肪率</div><div class="val" id="fat">-</div></div>
+      <div class="item"><div class="label">除脂肪体重</div><div class="val" id="lbm">-</div></div>
+      <div class="item"><div class="label">体水分率</div><div class="val" id="water">-</div></div>
+      <div class="item"><div class="label">骨格筋率</div><div class="val" id="muscle">-</div></div>
+      <div class="item"><div class="label">基礎代謝</div><div class="val" id="bmr">-</div></div>
+    </div>
+  </div>
+
+<script>
+const heightEl = document.getElementById('heightInput');
+const ageEl = document.getElementById('ageInput');
+const sexEl = document.getElementById('sexInput');
+
+// 前回の入力値を復元
+heightEl.value = localStorage.getItem('cm3_height') || '171.0';
+ageEl.value = localStorage.getItem('cm3_age') || '21';
+sexEl.value = localStorage.getItem('cm3_sex') || '1';
+
+function saveSettings() {
+  localStorage.setItem('cm3_height', heightEl.value);
+  localStorage.setItem('cm3_age', ageEl.value);
+  localStorage.setItem('cm3_sex', sexEl.value);
+}
+[heightEl, ageEl, sexEl].forEach(el => el.addEventListener('change', saveSettings));
+
+function calcBody(weightKg, impHigh, impLow) {
+  const heightCm = parseFloat(heightEl.value) || 170.0;
+  const age = parseInt(ageEl.value) || 25;
+  const isMale = sexEl.value === '1';
+
+  const heightM = heightCm / 100.0;
+  const bmi = (weightKg / (heightM * heightM)).toFixed(1);
+  let imp = ((impLow << 8) | impHigh) / 100.0;
+  if (imp < 200 || imp > 1200) imp = 444.3;
+
+  const sexFactor = isMale ? 1 : 0;
+  let lbm = (0.3674 * (heightCm ** 2) / imp) + (0.1753 * weightKg) - (0.11 * age) + (6.55 * sexFactor) + 21.8;
+  lbm = Math.min(lbm, weightKg * 0.95);
+
+  const fat = (((weightKg - lbm) / weightKg) * 100).toFixed(1);
+  const water = (isMale ? (fat * -0.73 + 69.5) : (fat * -0.70 + 66.0)).toFixed(1);
+  const muscle = ((lbm * 0.522) / weightKg * 100).toFixed(1);
+  const bmr = Math.round(370 + 21.6 * lbm);
+
+  return { bmi, fat, lbm: lbm.toFixed(1), water, muscle, bmr };
+}
+
+document.getElementById('scanBtn').addEventListener('click', async () => {
+  saveSettings();
+  const statusEl = document.getElementById('status');
+  try {
+    statusEl.textContent = 'BLEスキャン中... 体組成計に乗ってください';
+    await navigator.bluetooth.requestLEScan({
+      filters: [{ name: 'CM3-HM' }],
+      keepRepeatedDevices: true
+    });
+
+    navigator.bluetooth.addEventListener('advertisementreceived', event => {
+      const mData = event.manufacturerData.get(0xa0ac);
+      if (!mData || mData.byteLength < 12) return;
+
+      const dec = new Uint8Array(mData.byteLength);
+      for (let i = 0; i < mData.byteLength; i++) {
+        dec[i] = mData.getUint8(i) ^ 0xa0;
+      }
+
+      const isLocked = (dec[6] & 0x80) !== 0;
+      const weightG = (dec[8] << 8) | dec[9];
+      const weightKg = weightG / 1000.0;
+
+      if (weightKg > 0) {
+        document.getElementById('weight').textContent = weightKg.toFixed(1) + ' kg';
+        statusEl.textContent = isLocked ? '✅ 測定完了！' : '計測中...';
+
+        if (isLocked && weightKg > 5.0) {
+          const res = calcBody(weightKg, dec[7], dec[10]);
+          document.getElementById('bmi').textContent = res.bmi;
+          document.getElementById('fat').textContent = res.fat + ' %';
+          document.getElementById('lbm').textContent = res.lbm + ' kg';
+          document.getElementById('water').textContent = res.water + ' %';
+          document.getElementById('muscle').textContent = res.muscle + ' %';
+          document.getElementById('bmr').textContent = res.bmr + ' kcal';
+          document.getElementById('resultCard').style.display = 'block';
+        }
+      }
+    });
+  } catch (err) {
+    statusEl.textContent = 'エラー: ' + err;
+  }
+});
+</script>
+</body>
+</html>
